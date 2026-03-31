@@ -1,0 +1,306 @@
+// Chuck Agentic Loop — Attractor Proof-of-Concept
+//
+// This graph models the per-turn agent loop from the state management design.
+// The goal is to iterate on the undefined pieces — prompts, context assembly,
+// compaction thresholds, budget behavior — by running real LLM calls through
+// attractor before committing to Temporal Go code.
+//
+// What this graph exercises:
+//   - System prompt assembly and skill directory formatting
+//   - Tool result formatting and context window management
+//   - Budget exhaustion behavior (strip tools, force final)
+//   - Compaction summarization prompt and fidelity
+//   - Routing: when to loop, when to stop, when to compact
+
+digraph ChuckAgentLoop {
+    graph [
+        goal="Given a user message about a document corpus, reason over the query using available tools (search, code eval, memory, skills) and produce a helpful response. Stay within budget limits and manage context size.",
+        model_stylesheet="
+            * { llm_model: claude-sonnet-4-5; }
+            .reasoning { llm_model: claude-sonnet-4-5; reasoning_effort: high; }
+            .cheap { llm_model: claude-haiku-4-5; }
+            #agent_iteration { llm_model: claude-sonnet-4-5; }
+            #force_final { llm_model: claude-sonnet-4-5; }
+            #compact { llm_model: claude-haiku-4-5; }
+        ",
+        default_max_retries=2,
+        default_fidelity="full"
+    ]
+
+    // --- Entry / Exit ---
+
+    start [shape=Mdiamond, label="Turn Start"]
+    exit  [shape=Msquare,  label="Turn Complete"]
+
+    // --- Context Assembly ---
+    //
+    // This node is where the most undefined work lives: how do we assemble
+    // the system prompt, skill directory, conversation history, and tool
+    // results into a coherent context for the LLM?
+    //
+    // Iterate on this prompt until the LLM reliably understands its role,
+    // available tools, and constraints.
+
+    assemble_context [
+        shape=box,
+        label="Assemble Context",
+        prompt="You are a research assistant helping users search and analyze a large document corpus.
+
+Available tools (call any combination per turn):
+- semantic_search: Vector similarity search. Use for conceptual queries.
+- full_text_search: Keyword/phrase search with date and type filters. Use for specific terms.
+- eval_code: Run Python in a sandbox. Use for calculations, data transformation, aggregation.
+- store_memory / recall_memory: Persist and retrieve structured findings across turns.
+- load_skill: Load a specialized prompt by name from the skill library.
+
+Active skills:
+$skills_directory
+
+Previous tool results from this turn:
+$tool_results
+
+Conversation so far:
+$conversation_history
+
+User message: $user_message
+
+Instructions:
+- Search before answering. Do not guess at document contents.
+- Use multiple tools when a query spans topics or time periods.
+- Store key findings in memory for cross-turn recall.
+- If a search returns too many results, refine with filters.
+- If you have enough information to answer, respond directly without further tool calls.
+- Cite sources with document name and page/section where possible.",
+        class="reasoning",
+        goal_gate=true
+    ]
+
+    // --- Agent Iteration (LLM call) ---
+    //
+    // The core LLM call. In Temporal this is the AgentIteration activity.
+    // The prompt here represents what the LLM sees after context assembly.
+    // Fidelity is "full" — we carry the entire conversation thread so the
+    // LLM can see its prior reasoning and tool results.
+
+    agent_iteration [
+        shape=box,
+        label="Agent Iteration",
+        prompt="Review the assembled context and decide your next action.
+
+If you can fully answer the user's question with the information gathered so far, provide your final response. Be thorough but concise. Cite sources.
+
+If you need more information, call one or more tools. Explain your reasoning for each tool call briefly.
+
+Budget remaining: $budget_remaining tool calls, $iterations_remaining LLM iterations.
+If budget is low, prioritize answering with what you have over gathering more data.",
+        fidelity="full",
+        max_retries=1,
+        timeout="120s"
+    ]
+
+    // --- Routing: Done or Tools? ---
+
+    check_result [
+        shape=diamond,
+        label="Done or Tools?"
+    ]
+
+    // --- Budget Check ---
+
+    check_budget [
+        shape=diamond,
+        label="Budget Check"
+    ]
+
+    // --- Tool Execution ---
+    //
+    // In the real system, each tool is a separate Temporal activity.
+    // In attractor, we model sequential tool execution as a single node
+    // that iterates over the tool calls from the LLM response.
+    //
+    // The key iteration question: how should tool results be formatted
+    // before feeding back to the LLM? JSON? Markdown? Truncated?
+
+    execute_tools [
+        shape=parallelogram,
+        label="Execute Tools",
+        prompt="Execute each requested tool call sequentially. Format results as:
+
+Tool: $tool_name (call_id: $tool_call_id)
+Status: success | error
+Result:
+$tool_result
+
+If a result exceeds 4000 tokens, truncate and append:
+[Truncated — $total_tokens tokens. Call the tool again with narrower parameters for full results.]
+
+Collect all results for the next agent iteration.",
+        timeout="60s"
+    ]
+
+    // --- Publish Progress ---
+    //
+    // Write tool progress to DDB so the user sees what's happening.
+    // Non-critical — failure here shouldn't block the loop.
+
+    publish_progress [
+        shape=box,
+        label="Publish Progress",
+        prompt="Format a brief, user-facing progress update for the tools being executed:
+Tools called: $tool_names
+Status: In progress...
+
+Keep it under 100 characters. This appears in the UI while the user waits.",
+        class="cheap",
+        max_retries=3,
+        timeout="5s"
+    ]
+
+    // --- Force Final ---
+    //
+    // Budget exhausted. Strip tool definitions and force a text response.
+    // Key question: does the LLM produce a useful answer when forced to
+    // stop gathering information? Iterate on this prompt.
+
+    force_final [
+        shape=box,
+        label="Force Final Response",
+        prompt="You have used all available tool calls for this turn. You must now provide your best answer based on the information gathered so far.
+
+Synthesize your findings into a clear, well-organized response. If your research was incomplete, say so explicitly — tell the user what you found, what you were unable to determine, and suggest follow-up questions they could ask.
+
+Do not apologize for the limitation. Be direct about what is known vs. unknown.",
+        fidelity="full",
+        timeout="120s"
+    ]
+
+    // --- Publish Response ---
+
+    publish_response [
+        shape=box,
+        label="Publish Response",
+        prompt="Format the final assistant response for the user. Include:
+- The response text
+- A brief cost summary: $turn_cost USD, $tool_call_count tool calls, $iteration_count iterations
+
+Write the message to DDB and update conversation metadata.",
+        class="cheap",
+        timeout="5s",
+        max_retries=3
+    ]
+
+    // --- Compaction Check ---
+
+    check_compaction [
+        shape=diamond,
+        label="Compact?"
+    ]
+
+    // --- Compaction ---
+    //
+    // Another major TBD: the summarization prompt. How do we compress
+    // middle turns without losing critical details? Iterate on this.
+
+    compact [
+        shape=box,
+        label="Compact History",
+        prompt="Summarize the middle portion of this conversation for context compression. You will be given the full conversation history. Keep:
+- The system prompt (verbatim)
+- The first user message (verbatim)
+- The last $keep_recent_turns turns (verbatim)
+
+For all middle turns, produce a structured summary:
+
+## Conversation Summary (turns $first_summarized through $last_summarized)
+
+### Key Findings
+- [Bullet point each substantive finding with its source]
+
+### Tools Used
+- [Tool name]: [Brief description of what was searched/computed and key results]
+
+### Stored Memories
+- [Key]: [Value] (for any store_memory calls)
+
+### Unresolved Questions
+- [Anything the agent tried to find but couldn't]
+
+Target length: 500-1000 tokens for the summary. Preserve factual precision over narrative flow. Never drop source citations.",
+        class="cheap",
+        fidelity="truncate",
+        timeout="120s",
+        max_retries=1
+    ]
+
+    // --- Edges ---
+
+    start -> assemble_context
+
+    assemble_context -> agent_iteration
+
+    agent_iteration -> check_result
+
+    // LLM returned a final text response
+    check_result -> publish_response [
+        label="done",
+        condition="outcome=done"
+    ]
+
+    // LLM requested tool calls
+    check_result -> check_budget [
+        label="needs_tools",
+        condition="outcome=needs_tools"
+    ]
+
+    // Budget still available
+    check_budget -> publish_progress [
+        label="within_budget",
+        condition="context.budget_remaining!=0"
+    ]
+
+    publish_progress -> execute_tools
+
+    // Tools done, loop back for next iteration
+    execute_tools -> agent_iteration [
+        label="tools_complete"
+    ]
+
+    // Budget exhausted — force a final response
+    check_budget -> force_final [
+        label="budget_exhausted",
+        condition="context.budget_remaining=0"
+    ]
+
+    force_final -> publish_response [
+        label="forced_response"
+    ]
+
+    // After publishing, check if compaction is needed
+    publish_response -> check_compaction
+
+    check_compaction -> compact [
+        label="needs_compaction",
+        condition="context.snapshot_size_exceeds_threshold=true"
+    ]
+
+    check_compaction -> exit [
+        label="no_compaction",
+        weight=1
+    ]
+
+    compact -> exit [
+        label="compaction_complete"
+    ]
+
+    // --- Failure Routing ---
+
+    agent_iteration -> publish_response [
+        label="error",
+        condition="outcome=error"
+    ]
+
+    execute_tools -> agent_iteration [
+        label="tool_error",
+        condition="outcome=error"
+    ]
+}
